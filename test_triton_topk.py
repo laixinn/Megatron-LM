@@ -772,7 +772,9 @@ def _compute_index_scores_topk_native(
     scores = scores + mask
     topk = min(topk, q.size(0))
     topk_indices = scores.topk(topk, dim=-1)[1]
-    return scores, topk_indices
+    softmax_mi = scores.max(dim=-1)[0]
+    softmax_di = (scores-softmax_mi.unsqueeze(-1)).exp().sum(dim=-1)
+    return scores, topk_indices, softmax_mi, softmax_di
 
 
 
@@ -889,9 +891,9 @@ def test_compute_index_scores_triton(seqlen=16):
         diagonal=1,
     )
 
-    output_ref_masked_scores, output_ref_masked_topk = _compute_index_scores_topk_native(q, weights, k, mask, topk)
+    output_ref_masked_scores, output_ref_masked_topk, output_ref_masked_softmax_mi, output_ref_masked_softmax_di = _compute_index_scores_topk_native(q, weights, k, mask, topk)
 
-    output_triton_masked_topk = compute_index_scores_topk_triton(q, weights, k, topk, mask=mask)
+    output_triton_masked_topk, softmax_mi, softmax_di = compute_index_scores_topk_triton(q, weights, k, topk, mask=mask)
 
     topk_mask = ~torch.triu(
         torch.full((B, Sq, topk), 1, dtype=torch.bool, device='cuda'),
@@ -900,7 +902,12 @@ def test_compute_index_scores_triton(seqlen=16):
     assert torch.allclose(output_ref_masked_topk[topk_mask], output_triton_masked_topk[topk_mask], atol=1e-3, rtol=1e-3), (
         f"Max diff with mask and topk: {(output_ref_masked_topk - output_triton_masked_topk).abs().max().item()}"
     )
-    
+    assert torch.allclose(output_ref_masked_softmax_mi, softmax_mi, atol=1e-3, rtol=1e-3), (
+        f"Max diff with mask and softmax mi: {(output_ref_masked_softmax_mi - softmax_mi).abs().max().item()}"
+    )
+    assert torch.allclose(output_ref_masked_softmax_di, softmax_di, atol=1e-3, rtol=1e-3), (
+        f"Max diff with mask and softmax di: {(output_ref_masked_softmax_di - softmax_di).abs().max().item()}"
+    )
     print("✓ Test compute index scores triton passed!")
 
     query = torch.randn(Sq, B, H, D, dtype=torch.bfloat16).cuda()
@@ -1881,11 +1888,11 @@ if __name__ == "__main__":
     # benchmark_topk()
     # benchmark_topk_with_triton_benchmark()
 
-    # test_compute_index_scores_triton()
-    # benchmark_compute_index_scores_topk()
-    # benchmark_compute_index_scores_topk_detailed()
+    test_compute_index_scores_triton()
+    benchmark_compute_index_scores_topk()
+    benchmark_compute_index_scores_topk_detailed()
     
     # Test proper Triton implementation with @triton.jit kernels
-    test_dsa_indexer_loss_triton_proper()
-    test_dsa_indexer_loss_comprehensive_triton()
-    benchmark_dsa_indexer_loss_triton()
+    # test_dsa_indexer_loss_triton_proper()
+    # test_dsa_indexer_loss_comprehensive_triton()
+    # benchmark_dsa_indexer_loss_triton()
