@@ -501,15 +501,12 @@ def compute_index_scores_topk_triton(
 
 
 @triton.jit
-def _compute_dsa_indexer_loss_kernel(
+def _fwd_scores_with_topk_kernel_v2(
     Q_ptr,
     K_ptr,
     W_ptr,
     Mask_ptr,
     Out_Idx_ptr,
-    Attn_Query_ptr,
-    Attn_Key_ptr,
-    Loss_ptr,
     # Q strides: [Sq, B, H, D]
     stride_qs,
     stride_qb,
@@ -531,24 +528,177 @@ def _compute_dsa_indexer_loss_kernel(
     stride_ib,
     stride_is,
     stride_ik,
-    # Attn query strides: [Sq, B, H, D]
-    stride_asq,
-    stride_aqb,
-    stride_aqh,
-    stride_aqd,
-    # Attn key strides: [Sk, B, H, D]
-    stride_ask,
-    stride_akb,
-    stride_akh,
-    stride_akd,
-    # Loss strides: [B, Sq]
-    stride_lb,
-    stride_ls,
     # Dimensions
     H: tl.constexpr,
     D: tl.constexpr,
-    AH: tl.constexpr,
-    AD: tl.constexpr,
+    Sq: tl.constexpr,
+    Sk: tl.constexpr,
+    BLOCK_SQ: tl.constexpr,
+    BLOCK_SK: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    BLOCK_TOPK: tl.constexpr,
+    TOPK: tl.constexpr,
+    HAS_MASK: tl.constexpr,
+):
+    """
+    Fused index score computation + TopK selection.
+    
+    Grid: (B * Sq,) - one thread block per (b, sq) pair
+    
+    For each (b, sq):
+      1. Iterate over Sk in chunks
+      2. Compute scores for each chunk
+      3. Maintain running TopK in registers
+      4. Output TopK indices
+    
+    This avoids materializing the full [B, Sq, Sk] tensor.
+    """
+    b = tl.program_id(0)
+    sq_block_id = tl.program_id(1)
+    topk_block_id = tl.program_id(2)
+    sq = sq_block_id * BLOCK_SQ + tl.arange(0, BLOCK_SQ)
+    sq_valid = sq < Sq
+    topk_idxs = topk_block_id * BLOCK_TOPK + tl.arange(0, BLOCK_TOPK)
+    
+    # Initialize block TopK buffers in registers
+    block_topk_vals = tl.full([BLOCK_SQ, BLOCK_TOPK], float("-inf"), dtype=tl.float32)
+    block_topk_idxs = tl.full([BLOCK_SQ, BLOCK_TOPK], -1, dtype=tl.int32)
+    
+    # Base pointers for this (b, sq)
+    q_base = Q_ptr + b * stride_qb
+    k_base = K_ptr + b * stride_kb
+    w_base = W_ptr + sq * stride_ws + b * stride_wb
+
+    # compute topk indices
+    for sk_start in tl.range(0, Sk, BLOCK_SK):
+        sk_offs = sk_start + tl.arange(0, BLOCK_SK)
+        sk_valid = sk_offs < Sk
+        
+        # Compute index_scores for this chunk
+        index_scores = tl.zeros([BLOCK_SQ, BLOCK_SK], dtype=tl.float32)
+        
+        for h in tl.range(H):
+            w_val = tl.load(w_base + h * stride_wh, mask=sq_valid, other=0.0)
+            q_head_base = q_base + h * stride_qh
+            
+            dot = tl.zeros([BLOCK_SQ, BLOCK_SK], dtype=tl.float32)
+            
+            # Process D dimension in blocks for better memory access
+            for d_start in tl.range(0, D, BLOCK_D):
+                d_offs = d_start + tl.arange(0, BLOCK_D)
+                d_valid = d_offs < D
+                
+                # Load Q values for this D block
+                q_ptrs = q_head_base + sq[:, None] * stride_qs + d_offs[None, :] * stride_qd
+                q_vals = tl.load(q_ptrs, mask=(sq_valid[:, None] & d_valid[None, :]), other=0.0)
+
+                # Load K values for this D block
+                k_ptrs = k_base + sk_offs[None, :] * stride_ks + d_offs[:, None] * stride_kd
+                k_vals = tl.load(k_ptrs, mask=(sk_valid[None, :] & d_valid[None, :]), other=0.0)
+
+                # Compute dot product for this D block
+                dot += tl.dot(q_vals, k_vals)
+            
+            # ReLU
+            dot = tl.maximum(dot, 0.0)
+            index_scores += dot * w_val[:, None]
+        
+        if HAS_MASK:
+            mask_ptrs = Mask_ptr + b * stride_mb + sq[:, None] * stride_ms + sk_offs[None, :] * stride_mk
+            mask_vals = tl.load(mask_ptrs, mask=(sq_valid[:, None] & sk_valid[None, :]), other=float("-inf"))
+            index_scores = tl.where((sq_valid[:, None] & sk_valid[None, :]), index_scores + mask_vals, float("-inf"))
+        else:
+            index_scores = tl.where((sq_valid[:, None] & sk_valid[None, :]), index_scores, float("-inf"))
+
+        # streaming topk v2
+        new_topk_vals = tl.full([BLOCK_SQ, BLOCK_TOPK], float("-inf"), dtype=tl.float32)
+        new_topk_idxs = tl.full([BLOCK_SQ, BLOCK_TOPK], -1, dtype=tl.int32)
+
+        # [BLOCK_SQ, BLOCK_SK]: intra-chunk rank counts across BLOCK_SK
+        chunk_gt_chunk = (index_scores[:, :, None] > index_scores[:, None, :]) | \
+            ((index_scores[:, :, None] == index_scores[:, None, :]) & (sk_offs[:, None] < sk_offs[None, :]))
+        count_chunk_gt_chunk = tl.sum(chunk_gt_chunk, axis=-1)
+        tl.static_print("621", count_chunk_gt_chunk.shape)
+
+        topk_vals_working = block_topk_vals
+        chunk_vals_working = index_scores
+
+        # [BLOCK_SQ, BLOCK_TOPK]: rank topk over chunk
+        chunk_gt_topk = (chunk_vals_working[:, None, :] > topk_vals_working[:, :, None])
+        rank_topk = tl.sum(chunk_gt_topk, axis=-1)
+        rank_topk += topk_idxs[None, :]
+        tl.static_print("630", rank_topk.shape)
+
+        # [BLOCK_SQ, BLOCK_SK]: rank chunk over topk
+        topk_gt_chunk = (topk_vals_working[:, None, :] >= chunk_vals_working[:, :, None])
+        rank_chunk = tl.sum(topk_gt_chunk, axis=-1)
+        rank_chunk += count_chunk_gt_chunk
+        tl.static_print("636", rank_chunk.shape)
+
+        # [BLOCK_SQ, BLOCK_TOPK, BLOCK_SK] -> [BLOCK_SQ, BLOCK_TOPK]: gather topk
+        topk_matches = (rank_topk[:, :, None] == topk_idxs[None, :, None])
+        gathered_topk_vals = tl.sum(tl.where(topk_matches, topk_vals_working[:, :, None], 0.0), axis=-1)
+        gathered_topk_idxs = tl.sum(tl.where(topk_matches, block_topk_idxs[None, :, None], 0), axis=-1)
+        topk_valid = tl.sum(topk_matches, axis=-1) > 0
+        tl.static_print("643", topk_valid.shape)
+        
+        # [BLOCK_SQ, BLOCK_TOPK, BLOCK_SK] -> [BLOCK_SQ, BLOCK_TOPK]: gather chunk
+        chunk_matches = (rank_chunk[:, None, :] == topk_idxs[None, :, None])
+        gathered_chunk_vals = tl.sum(tl.where(chunk_matches, chunk_vals_working[:, None, :], 0.0), axis=-1)
+        gathered_chunk_idxs = tl.sum(tl.where(chunk_matches, sk_offs[None, None, :], 0), axis=-1)
+        tl.static_print("649", gathered_chunk_idxs.shape)
+
+        all_valid = topk_valid + (tl.sum(chunk_matches, axis=-1) > 0)
+        tl.device_print("652", all_valid)
+
+        # Merge chunk and topk
+        new_topk_vals = tl.where(topk_valid, gathered_topk_vals, gathered_chunk_vals)
+        new_topk_idxs = tl.where(topk_valid, gathered_topk_idxs.to(tl.int32), gathered_chunk_idxs.to(tl.int32))
+        tl.static_print("654", new_topk_idxs.shape)
+
+        # Update global topk
+        block_topk_vals = new_topk_vals
+        block_topk_idxs = tl.reshape(new_topk_idxs, (BLOCK_SQ, BLOCK_TOPK))
+
+    # Store TopK indices
+    idx_base = Out_Idx_ptr + b * stride_ib + sq[:, None] * stride_is + topk_idxs * stride_ik
+    idx_mask = topk_idxs < TOPK
+    tl.static_print("666", idx_mask.shape)
+    tl.static_print("667", block_topk_idxs.shape)
+    tl.store(idx_base, block_topk_idxs, mask=(sq_valid[:, None] & idx_mask[None, :]))
+
+
+@triton.jit
+def _fwd_scores_with_topk_kernel(
+    Q_ptr,
+    K_ptr,
+    W_ptr,
+    Mask_ptr,
+    Out_Idx_ptr,
+    # Q strides: [Sq, B, H, D]
+    stride_qs,
+    stride_qb,
+    stride_qh,
+    stride_qd,
+    # K strides: [Sk, B, D]
+    stride_ks,
+    stride_kb,
+    stride_kd,
+    # W strides: [Sq, B, H]
+    stride_ws,
+    stride_wb,
+    stride_wh,
+    # Mask strides: [B, Sq, Sk]
+    stride_mb,
+    stride_ms,
+    stride_mk,
+    # Out strides: [B, Sq, TopK]
+    stride_ib,
+    stride_is,
+    stride_ik,
+    # Dimensions
+    H: tl.constexpr,
+    D: tl.constexpr,
     Sq: tl.constexpr,
     Sk: tl.constexpr,
     BLOCK_SQ: tl.constexpr,
@@ -556,8 +706,6 @@ def _compute_dsa_indexer_loss_kernel(
     BLOCK_D: tl.constexpr,
     TOPK: tl.constexpr,
     HAS_MASK: tl.constexpr,
-    SPARSE_LOSS: tl.constexpr,
-    Softmax_Scale: tl.constexpr,
 ):
     """
     Fused index score computation + TopK selection.
@@ -587,17 +735,6 @@ def _compute_dsa_indexer_loss_kernel(
     q_base = Q_ptr + b * stride_qb
     k_base = K_ptr + b * stride_kb
     w_base = W_ptr + sq * stride_ws + b * stride_wb
-
-    # TODO: consider TP rank offset
-    aq_base = Attn_Query_ptr + b * stride_aqb
-    ak_base = Attn_Key_ptr + b * stride_akb
-
-    # 1-pass loss recursion
-    m_i = tl.full([AH, BLOCK_SQ], float("-inf"), dtype=tl.float32)
-    m1_i = tl.full([BLOCK_SQ], float("-inf"), dtype=tl.float32)
-    d_i = tl.zeros([AH, BLOCK_SQ], dtype=tl.float32)
-    d1_i = tl.zeros([BLOCK_SQ], dtype=tl.float32)
-    loss_i = tl.zeros([BLOCK_SQ], dtype=tl.float32)
 
     # compute topk indices
     for sk_start in tl.range(0, Sk, BLOCK_SK):
@@ -643,7 +780,7 @@ def _compute_dsa_indexer_loss_kernel(
         else:
             index_scores = tl.where((sq_valid[:, None] & sk_valid[None, :]), index_scores, float("-inf"))
 
-        '''streaming topk'''
+        # streaming topk
         new_topk_vals = tl.full([BLOCK_SQ, TOPK], float("-inf"), dtype=tl.float32)
         new_topk_idxs = tl.full([BLOCK_SQ, TOPK], -1, dtype=tl.int32)
         
@@ -662,12 +799,10 @@ def _compute_dsa_indexer_loss_kernel(
             # Find argmax from topk buffer
             is_max_topk = (topk_vals_working == max_from_topk[:, None])
             argmax_topk = tl.min(tl.where(is_max_topk, topk_idxs, Sk), axis=1)
-            # argmax_topk = tl.max(tl.where(is_max_topk, topk_idxs, -1), axis=1)
 
             # Find argmax from chunk
             is_max_chunk = (chunk_vals_working == max_from_chunk[:, None])
             argmax_chunk = tl.min(tl.where(is_max_chunk, sk_offs, Sk), axis=1)
-            # argmax_chunk = tl.max(tl.where(is_max_chunk, sk_offs, -1), axis=1)
             
             # Select index based on which source we chose
             # For topk source, we need to get the actual stored index
@@ -688,6 +823,96 @@ def _compute_dsa_indexer_loss_kernel(
     # Store TopK indices
     idx_base = Out_Idx_ptr + b * stride_ib + sq[:, None] * stride_is + tl.arange(0, TOPK)[None, :] * stride_ik
     tl.store(idx_base, topk_idxs, mask=(sq_valid[:, None] & (tl.arange(0, TOPK)[None, :] < TOPK)))
+
+
+@triton.jit
+def _fwd_loss_kernel(
+    Q_ptr,
+    K_ptr,
+    W_ptr,
+    Mask_ptr,
+    Topk_Idx_ptr,
+    Attn_Query_ptr,
+    Attn_Key_ptr,
+    Loss_ptr,
+    # Q strides: [Sq, B, H, D]
+    stride_qs,
+    stride_qb,
+    stride_qh,
+    stride_qd,
+    # K strides: [Sk, B, D]
+    stride_ks,
+    stride_kb,
+    stride_kd,
+    # W strides: [Sq, B, H]
+    stride_ws,
+    stride_wb,
+    stride_wh,
+    # Mask strides: [B, Sq, Sk]
+    stride_mb,
+    stride_ms,
+    stride_mk,
+    # Out strides: [B, Sq, TopK]
+    stride_ib,
+    stride_is,
+    stride_ik,
+    # Attn query strides: [Sq, B, H, D]
+    stride_asq,
+    stride_aqb,
+    stride_aqh,
+    stride_aqd,
+    # Attn key strides: [Sk, B, H, D]
+    stride_ask,
+    stride_akb,
+    stride_akh,
+    stride_akd,
+    # Loss strides: [B, Sq]
+    stride_lb,
+    stride_ls,
+    # Dimensions
+    H: tl.constexpr,
+    D: tl.constexpr,
+    AH: tl.constexpr,
+    AD: tl.constexpr,
+    Sq: tl.constexpr,
+    Sk: tl.constexpr,
+    ASq: tl.constexpr,
+    Sq_offset: tl.constexpr,
+    BLOCK_SQ: tl.constexpr,
+    BLOCK_SK: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    TOPK: tl.constexpr,
+    HAS_MASK: tl.constexpr,
+    SPARSE_LOSS: tl.constexpr,
+    Softmax_Scale: tl.constexpr,
+):
+    b = tl.program_id(0)
+    sq_block_id = tl.program_id(1)
+    
+    # should be within (ASq_offset, ASq_offset + ASq)
+    aq = sq_block_id * BLOCK_SQ + tl.arange(0, BLOCK_SQ)
+    aq_valid = (aq < ASq)
+    sq = Sq_offset + sq_block_id * BLOCK_SQ + tl.arange(0, BLOCK_SQ)
+    sq_valid = (sq < Sq) & (sq < Sq_offset + ASq)
+    
+    # Base pointers for this (b, sq)
+    q_base = Q_ptr + b * stride_qb
+    k_base = K_ptr + b * stride_kb
+    w_base = W_ptr + sq * stride_ws + b * stride_wb
+
+    aq_base = Attn_Query_ptr + b * stride_aqb
+    ak_base = Attn_Key_ptr + b * stride_akb
+
+    # 1-pass loss recursion
+    m_i = tl.full([AH, BLOCK_SQ], float("-inf"), dtype=tl.float32)
+    m1_i = tl.full([BLOCK_SQ], float("-inf"), dtype=tl.float32)
+    d_i = tl.zeros([AH, BLOCK_SQ], dtype=tl.float32)
+    d1_i = tl.zeros([BLOCK_SQ], dtype=tl.float32)
+    loss_i = tl.zeros([BLOCK_SQ], dtype=tl.float32)
+
+    if SPARSE_LOSS:
+        topk_idxs_ptrs = Topk_Idx_ptr + b * stride_ib + sq[:, None] * stride_is + tl.arange(0, TOPK)[None, :] * stride_ik
+        topk_idxs = tl.load(topk_idxs_ptrs, mask=sq_valid[:, None], other=-1)
 
     # compute the first pass for attn softmax and index softmax
     # apply causal mask by loop trunctation
@@ -760,10 +985,10 @@ def _compute_dsa_indexer_loss_kernel(
                 d_offs = d_start + tl.arange(0, BLOCK_D)
                 d_valid = d_offs < AD
 
-                aq_ptrs = aq_head_base + sq[:, None] * stride_asq + d_offs[None, :] * stride_aqd
+                aq_ptrs = aq_head_base + aq[:, None] * stride_asq + d_offs[None, :] * stride_aqd
                 ak_ptrs = ak_head_base + sk_offs[None, :] * stride_ask + d_offs[:, None] * stride_akd
 
-                aq_vals = tl.load(aq_ptrs, mask=(sq_valid[:, None] & d_valid[None, :]), other=0.0)
+                aq_vals = tl.load(aq_ptrs, mask=(aq_valid[:, None] & d_valid[None, :]), other=0.0)
                 ak_vals = tl.load(ak_ptrs, mask=(sk_valid[None, :] & d_valid[:, None]), other=0.0)
 
                 dot += tl.dot(aq_vals, ak_vals)
@@ -853,10 +1078,10 @@ def _compute_dsa_indexer_loss_kernel(
                 d_offs = d_start + tl.arange(0, BLOCK_D)
                 d_valid = d_offs < AD
 
-                aq_ptrs = aq_head_base + sq[:, None] * stride_asq + d_offs[None, :] * stride_aqd
+                aq_ptrs = aq_head_base + aq[:, None] * stride_asq + d_offs[None, :] * stride_aqd
                 ak_ptrs = ak_head_base + sk_offs[None, :] * stride_ask + d_offs[:, None] * stride_akd
 
-                aq_vals = tl.load(aq_ptrs, mask=(sq_valid[:, None] & d_valid[None, :]), other=0.0)
+                aq_vals = tl.load(aq_ptrs, mask=(aq_valid[:, None] & d_valid[None, :]), other=0.0)
                 ak_vals = tl.load(ak_ptrs, mask=(sk_valid[None, :] & d_valid[:, None]), other=0.0)
 
                 dot += tl.dot(aq_vals, ak_vals)
@@ -885,7 +1110,7 @@ def _compute_dsa_indexer_loss_kernel(
         loss_i += loss_sk.sum(axis=-1)
 
     # Store loss
-    tl.store(Loss_ptr + b * stride_lb + sq * stride_ls, loss_i, mask=sq_valid)
+    tl.store(Loss_ptr + b * stride_lb + aq * stride_ls, loss_i, mask=aq_valid)
 
 
 def compute_dsa_indexer_loss_triton(
@@ -926,57 +1151,18 @@ def compute_dsa_indexer_loss_triton(
     ASq, AB, AH, AD = attn_query.shape
     ASk = attn_key.shape[0]
 
-    assert Sq == ASq and Sk == ASk and AB == B and AD == D
-
     # Clamp topk to valid range
-    topk = min(topk, Sk)
+    # topk = min(topk, Sk)
+    assert topk <= Sk
 
-    if pg_collection is not None and pg_collection.tp.size() > 1:
-        assert pg_collection.cp is None or pg_collection.cp.size() == 1, "This kernel does not support TP and CP together."
-        tp_size = pg_collection.tp.size()
-
-        if ASq == ASk:
-            assert ASq % tp_size == 0
-            packed_qk = torch.stack([attn_query, attn_key], dim=-1)
-            # [ASq, B, H, D, 2] -> [tp_size, H, ASq // tp_size, B, D, 2]
-            packed_qk = (
-                packed_qk.permute(2, 0, 1, 3, 4)
-                .reshape(AH, tp_size, ASq // tp_size, AB, AD, 2)
-                .transpose(0, 1)
-                .contiguous()
-            )
-            output_qk = torch.empty_like(packed_qk)
-            torch.distributed.all_to_all_single(
-                output_qk, 
-                packed_qk,
-                group=pg_collection.tp
-            )
-            # [tp_size, H, ASq // tp_size, B, D, 2] -> [H * tp_size, ASq // tp_size, B, D, 2]
-            output_qk = output_qk.reshape(AH * tp_size, ASq // tp_size, AB, AD, 2)
-            # [H * tp_size, ASq // tp_size, B, D, 2] -> [ASq // tp_size, B, H * tp_size, D, 2]
-            output_qk = output_qk.permute(1, 2, 0, 3, 4).contiguous()
-            attn_query, attn_key = output_qk.unbind(dim=-1)
-            attn_query = attn_query.contiguous()
-            attn_key = attn_key.contiguous()
-        else:
-            # TODO: support different ASq and ASk
-            raise ValueError(f"ASq {ASq} != ASk {ASk}")
-
-        ASq, AB, AH, AD = attn_query.shape
-        ASk = attn_key.shape[0]
-        
-        # TODO: do not split index scores, it introduces extra problem in communication and casual mask
-    
     # Output tensor
     out_idx = torch.empty((B, Sq, topk), dtype=torch.int64, device=q.device)
-    out_loss = torch.empty((B, Sq), dtype=torch.float32, device=q.device)
     
     BLOCK_SQ = 16
     BLOCK_SK = 128
     BLOCK_D = 128
 
     num_sq_blocks = (Sq + BLOCK_SQ - 1) // BLOCK_SQ
-    grid = (B, num_sq_blocks,)
     
     # Handle mask strides
     if mask is not None:
@@ -987,13 +1173,117 @@ def compute_dsa_indexer_loss_triton(
     else:
         stride_mb = stride_ms = stride_mk = 0
         has_mask = False
+
+    current_stream = torch.cuda.current_stream()
+    topk_stream = torch.cuda.Stream()
+    topk_stream.wait_stream(current_stream)
+    with torch.cuda.stream(topk_stream):
+        grid = (B, num_sq_blocks,)
+        _fwd_scores_with_topk_kernel[grid](
+            Q_ptr=q,
+            K_ptr=k,
+            W_ptr=weights,
+            Mask_ptr=mask,
+            Out_Idx_ptr=out_idx,
+            # Q strides
+            stride_qs=q.stride(0),
+            stride_qb=q.stride(1),
+            stride_qh=q.stride(2),
+            stride_qd=q.stride(3),
+            # K strides
+            stride_ks=k.stride(0),
+            stride_kb=k.stride(1),
+            stride_kd=k.stride(2),
+            # W strides
+            stride_ws=weights.stride(0),
+            stride_wb=weights.stride(1),
+            stride_wh=weights.stride(2),
+            # Mask strides
+            stride_mb=stride_mb,
+            stride_ms=stride_ms,
+            stride_mk=stride_mk,
+            # Out strides
+            stride_ib=out_idx.stride(0),
+            stride_is=out_idx.stride(1),
+            stride_ik=out_idx.stride(2),
+            # Dimensions
+            H=H,
+            D=D,
+            Sq=Sq,
+            Sk=Sk,
+            BLOCK_SQ=BLOCK_SQ,
+            BLOCK_SK=BLOCK_SK,
+            BLOCK_D=BLOCK_D,
+            TOPK=topk,
+            HAS_MASK=has_mask,
+        )
+
+    Sq_offset = 0
+    if pg_collection is not None and pg_collection.tp.size() > 1:
+        tp_size = pg_collection.tp.size()
+
+        # all-to-all for attn query
+        assert ASq % tp_size == 0
+        # [ASq, B, H, D] -> [tp_size, H, ASq // tp_size, B, D]
+        view_attn_q = (
+            attn_query.permute(2, 0, 1, 3)
+            .reshape(AH, tp_size, ASq // tp_size, AB, AD)
+            .transpose(0, 1)
+            .contiguous()
+        )
+        output_attn_q = torch.empty_like(view_attn_q)
+        dist.all_to_all_single(
+            output_attn_q, 
+            view_attn_q,
+            group=pg_collection.tp
+        )
+        # [tp_size, H, ASq // tp_size, B, D] -> [ASq // tp_size, B, H * tp_size, D]
+        attn_query = (
+            output_attn_q.reshape(AH * tp_size, ASq // tp_size, AB, AD)
+            .permute(1, 2, 0, 3)
+            .contiguous()
+        )
+
+        # all-gather for attn key
+        gathered_attn_k = torch.empty(
+            (tp_size, *attn_key.shape), 
+            device=attn_key.device, 
+            dtype=attn_key.dtype
+        )
+        dist.all_gather_into_tensor(gathered_attn_k, attn_key.contiguous(), group=pg_collection.tp)
+        # [tp_size, Sk, B, H, D] -> [Sk, B, H * tp_size, D]
+        attn_key = (
+            gathered_attn_k.permute(1, 2, 0, 3, 4)
+            .reshape(ASk, AB, AH * tp_size, AD)
+            .contiguous()
+        )
+
+        ASq, AB, AH, AD = attn_query.shape
+        AHk = attn_key.shape[2]
+
+        assert Sq == ASq * tp_size and \
+            Sk == ASk and AH == H and AHk == H and \
+            AB == B and AD == D
+        
+        # Do not split index scores, it introduces extra problem in communication and casual mask
+        # Sq should be within (Sq_offset, Sq_offset + Sq)
+        tp_rank = pg_collection.tp.rank()
+        Sq_offset = Sq // tp_size * tp_rank
+        assert Sq_offset + ASq <= Sq
+
+    torch.cuda.synchronize()
+    assert out_idx.max() < Sk
+
+    out_loss = torch.empty((B, ASq), dtype=torch.float32, device=q.device)
+    attn_num_sq_blocks = (ASq + BLOCK_SQ - 1) // BLOCK_SQ
+    attn_grid = (B, attn_num_sq_blocks,)
     
-    _compute_dsa_indexer_loss_kernel[grid](
+    _fwd_loss_kernel[attn_grid](
         Q_ptr=q,
         K_ptr=k,
         W_ptr=weights,
         Mask_ptr=mask,
-        Out_Idx_ptr=out_idx,
+        Topk_Idx_ptr=out_idx,
         Attn_Query_ptr=attn_query,
         Attn_Key_ptr=attn_key,
         Loss_ptr=out_loss,
@@ -1014,7 +1304,7 @@ def compute_dsa_indexer_loss_triton(
         stride_mb=stride_mb,
         stride_ms=stride_ms,
         stride_mk=stride_mk,
-        # Out strides
+        # Topk indices strides
         stride_ib=out_idx.stride(0),
         stride_is=out_idx.stride(1),
         stride_ik=out_idx.stride(2),
@@ -1038,6 +1328,8 @@ def compute_dsa_indexer_loss_triton(
         AD=AD,
         Sq=Sq,
         Sk=Sk,
+        ASq=ASq,
+        Sq_offset=Sq_offset,
         BLOCK_SQ=BLOCK_SQ,
         BLOCK_SK=BLOCK_SK,
         BLOCK_D=BLOCK_D,
@@ -1051,7 +1343,7 @@ def compute_dsa_indexer_loss_triton(
 
     if pg_collection is not None and pg_collection.tp.size() > 1:
         # reduce loss
-        torch.distributed.all_reduce(indexer_loss, group=pg_collection.tp)
+        dist.all_reduce(indexer_loss, group=pg_collection.tp)
         indexer_loss /= pg_collection.tp.size()
     
     return out_idx, indexer_loss, out_loss
