@@ -576,6 +576,7 @@ def _fwd_loss_kernel(
     Attn_Query_ptr,
     Attn_Key_ptr,
     Loss_ptr,
+    Index_Mask_ptr,
     # Q strides: [Sq, B, H, D]
     stride_qs,
     stride_qb,
@@ -610,6 +611,10 @@ def _fwd_loss_kernel(
     # Loss strides: [B, Sq]
     stride_lb,
     stride_ls,
+    # Index mask strides: [B, Sq, Sk]
+    stride_imb,
+    stride_ims,
+    stride_imk,
     # Dimensions
     H: tl.constexpr,
     D: tl.constexpr,
@@ -696,20 +701,24 @@ def _fwd_loss_kernel(
             index_scores = tl.where((sq_valid[:, None] & sk_valid[None, :]), index_scores, float("-inf"))
 
         if SPARSE_LOSS:
-            for topk_start in tl.range(0, TOPK, BLOCK_TOPK):
-                # load topk indices
-                topk_offs = topk_start + tl.arange(0, BLOCK_TOPK)
-                topk_valid = topk_offs < TOPK
-                topk_idxs_ptrs = Topk_Idx_ptr + b * stride_ib + sq[:, None] * stride_is + topk_offs[None, :] * stride_ik
-                topk_idxs = tl.load(topk_idxs_ptrs, mask=(sq_valid[:, None] & topk_valid[None, :]), other=0)
+            index_mask_ptrs = Index_Mask_ptr + b * stride_imb + sq[:, None] * stride_ims + sk_offs[None, :] * stride_imk
+            index_mask = tl.load(index_mask_ptrs, mask=(sq_valid[:, None] & sk_valid[None, :]), other=float("-inf"))
+            index_scores += index_mask
 
-                # [BLOCK_SQ, BLOCK_TOPK, 1] x [1, 1, BLOCK_SK] -> [BLOCK_SQ, BLOCK_TOPK, BLOCK_SK]
-                is_in_topk = (topk_idxs[:, :, None] == sk_offs[None, None, :])
-                # [BLOCK_SQ, BLOCK_TOPK, BLOCK_SK] -> [BLOCK_SQ, BLOCK_SK]
-                is_in_topk = tl.sum(is_in_topk, axis=1) > 0
+            # for topk_start in tl.range(0, TOPK, BLOCK_TOPK):
+            #     # load topk indices
+            #     topk_offs = topk_start + tl.arange(0, BLOCK_TOPK)
+            #     topk_valid = topk_offs < TOPK
+            #     topk_idxs_ptrs = Topk_Idx_ptr + b * stride_ib + sq[:, None] * stride_is + topk_offs[None, :] * stride_ik
+            #     topk_idxs = tl.load(topk_idxs_ptrs, mask=(sq_valid[:, None] & topk_valid[None, :]), other=0)
 
-                sparse_mask = tl.where(is_in_topk, 0.0, float("-inf"))
-                index_scores += sparse_mask
+            #     # [BLOCK_SQ, BLOCK_TOPK, 1] x [1, 1, BLOCK_SK] -> [BLOCK_SQ, BLOCK_TOPK, BLOCK_SK]
+            #     is_in_topk = (topk_idxs[:, :, None] == sk_offs[None, None, :])
+            #     # [BLOCK_SQ, BLOCK_TOPK, BLOCK_SK] -> [BLOCK_SQ, BLOCK_SK]
+            #     is_in_topk = tl.sum(is_in_topk, axis=1) > 0
+
+            #     sparse_mask = tl.where(is_in_topk, 0.0, float("-inf"))
+            #     index_scores += sparse_mask
         
         # first pass for index softmax
         m1_i_1 = m1_i
@@ -748,20 +757,21 @@ def _fwd_loss_kernel(
         attn_scores += casual_mask[None, :, :]
 
         if SPARSE_LOSS:
-            for topk_start in tl.range(0, TOPK, BLOCK_TOPK):
-                # load topk indices
-                topk_offs = topk_start + tl.arange(0, BLOCK_TOPK)
-                topk_valid = topk_offs < TOPK
-                topk_idxs_ptrs = Topk_Idx_ptr + b * stride_ib + sq[:, None] * stride_is + topk_offs[None, :] * stride_ik
-                topk_idxs = tl.load(topk_idxs_ptrs, mask=(sq_valid[:, None] & topk_valid[None, :]), other=0)
+            attn_scores += index_mask[None, :, :]
+            # for topk_start in tl.range(0, TOPK, BLOCK_TOPK):
+            #     # load topk indices
+            #     topk_offs = topk_start + tl.arange(0, BLOCK_TOPK)
+            #     topk_valid = topk_offs < TOPK
+            #     topk_idxs_ptrs = Topk_Idx_ptr + b * stride_ib + sq[:, None] * stride_is + topk_offs[None, :] * stride_ik
+            #     topk_idxs = tl.load(topk_idxs_ptrs, mask=(sq_valid[:, None] & topk_valid[None, :]), other=0)
 
-                # [BLOCK_SQ, BLOCK_TOPK, 1] x [1, 1, BLOCK_SK] -> [BLOCK_SQ, BLOCK_TOPK, BLOCK_SK]
-                is_in_topk = (topk_idxs[:, :, None] == sk_offs[None, None, :])
-                # [BLOCK_SQ, BLOCK_TOPK, BLOCK_SK] -> [BLOCK_SQ, BLOCK_SK]
-                is_in_topk = tl.sum(is_in_topk, axis=1) > 0
+            #     # [BLOCK_SQ, BLOCK_TOPK, 1] x [1, 1, BLOCK_SK] -> [BLOCK_SQ, BLOCK_TOPK, BLOCK_SK]
+            #     is_in_topk = (topk_idxs[:, :, None] == sk_offs[None, None, :])
+            #     # [BLOCK_SQ, BLOCK_TOPK, BLOCK_SK] -> [BLOCK_SQ, BLOCK_SK]
+            #     is_in_topk = tl.sum(is_in_topk, axis=1) > 0
 
-                sparse_mask = tl.where(is_in_topk, 0.0, float("-inf"))
-                attn_scores += sparse_mask[None, :, :]
+            #     sparse_mask = tl.where(is_in_topk, 0.0, float("-inf"))
+            #     attn_scores += sparse_mask[None, :, :]
 
         m_i_1 = m_i
         m_i = tl.maximum(m_i, tl.max(attn_scores, axis=-1))
@@ -813,20 +823,23 @@ def _fwd_loss_kernel(
             index_scores = tl.where((sq_valid[:, None] & sk_valid[None, :]), index_scores, float("-inf"))
 
         if SPARSE_LOSS:
-            for topk_start in tl.range(0, TOPK, BLOCK_TOPK):
-                # load topk indices
-                topk_offs = topk_start + tl.arange(0, BLOCK_TOPK)
-                topk_valid = topk_offs < TOPK
-                topk_idxs_ptrs = Topk_Idx_ptr + b * stride_ib + sq[:, None] * stride_is + topk_offs[None, :] * stride_ik
-                topk_idxs = tl.load(topk_idxs_ptrs, mask=(sq_valid[:, None] & topk_valid[None, :]), other=0)
+            index_mask_ptrs = Index_Mask_ptr + b * stride_imb + sq[:, None] * stride_ims + sk_offs[None, :] * stride_imk
+            index_mask = tl.load(index_mask_ptrs, mask=(sq_valid[:, None] & sk_valid[None, :]), other=float("-inf"))
+            index_scores += index_mask
+            # for topk_start in tl.range(0, TOPK, BLOCK_TOPK):
+            #     # load topk indices
+            #     topk_offs = topk_start + tl.arange(0, BLOCK_TOPK)
+            #     topk_valid = topk_offs < TOPK
+            #     topk_idxs_ptrs = Topk_Idx_ptr + b * stride_ib + sq[:, None] * stride_is + topk_offs[None, :] * stride_ik
+            #     topk_idxs = tl.load(topk_idxs_ptrs, mask=(sq_valid[:, None] & topk_valid[None, :]), other=0)
 
-                # [BLOCK_SQ, BLOCK_TOPK, 1] x [1, 1, BLOCK_SK] -> [BLOCK_SQ, BLOCK_TOPK, BLOCK_SK]
-                is_in_topk = (topk_idxs[:, :, None] == sk_offs[None, None, :])
-                # [BLOCK_SQ, BLOCK_TOPK, BLOCK_SK] -> [BLOCK_SQ, BLOCK_SK]
-                is_in_topk = tl.sum(is_in_topk, axis=1) > 0
+            #     # [BLOCK_SQ, BLOCK_TOPK, 1] x [1, 1, BLOCK_SK] -> [BLOCK_SQ, BLOCK_TOPK, BLOCK_SK]
+            #     is_in_topk = (topk_idxs[:, :, None] == sk_offs[None, None, :])
+            #     # [BLOCK_SQ, BLOCK_TOPK, BLOCK_SK] -> [BLOCK_SQ, BLOCK_SK]
+            #     is_in_topk = tl.sum(is_in_topk, axis=1) > 0
 
-                sparse_mask = tl.where(is_in_topk, 0.0, float("-inf"))
-                index_scores += sparse_mask
+            #     sparse_mask = tl.where(is_in_topk, 0.0, float("-inf"))
+            #     index_scores += sparse_mask
 
         '''
         compute loss - online softmax with head summation and L1 normalization
@@ -861,20 +874,21 @@ def _fwd_loss_kernel(
         attn_scores += casual_mask[None, :, :]
 
         if SPARSE_LOSS:
-            for topk_start in tl.range(0, TOPK, BLOCK_TOPK):
-                # load topk indices
-                topk_offs = topk_start + tl.arange(0, BLOCK_TOPK)
-                topk_valid = topk_offs < TOPK
-                topk_idxs_ptrs = Topk_Idx_ptr + b * stride_ib + sq[:, None] * stride_is + topk_offs[None, :] * stride_ik
-                topk_idxs = tl.load(topk_idxs_ptrs, mask=(sq_valid[:, None] & topk_valid[None, :]), other=0)
+            attn_scores += index_mask[None, :, :]
+            # for topk_start in tl.range(0, TOPK, BLOCK_TOPK):
+            #     # load topk indices
+            #     topk_offs = topk_start + tl.arange(0, BLOCK_TOPK)
+            #     topk_valid = topk_offs < TOPK
+            #     topk_idxs_ptrs = Topk_Idx_ptr + b * stride_ib + sq[:, None] * stride_is + topk_offs[None, :] * stride_ik
+            #     topk_idxs = tl.load(topk_idxs_ptrs, mask=(sq_valid[:, None] & topk_valid[None, :]), other=0)
 
-                # [BLOCK_SQ, BLOCK_TOPK, 1] x [1, 1, BLOCK_SK] -> [BLOCK_SQ, BLOCK_TOPK, BLOCK_SK]
-                is_in_topk = (topk_idxs[:, :, None] == sk_offs[None, None, :])
-                # [BLOCK_SQ, BLOCK_TOPK, BLOCK_SK] -> [BLOCK_SQ, BLOCK_SK]
-                is_in_topk = tl.sum(is_in_topk, axis=1) > 0
+            #     # [BLOCK_SQ, BLOCK_TOPK, 1] x [1, 1, BLOCK_SK] -> [BLOCK_SQ, BLOCK_TOPK, BLOCK_SK]
+            #     is_in_topk = (topk_idxs[:, :, None] == sk_offs[None, None, :])
+            #     # [BLOCK_SQ, BLOCK_TOPK, BLOCK_SK] -> [BLOCK_SQ, BLOCK_SK]
+            #     is_in_topk = tl.sum(is_in_topk, axis=1) > 0
 
-                sparse_mask = tl.where(is_in_topk, 0.0, float("-inf"))
-                attn_scores += sparse_mask[None, :, :]
+            #     sparse_mask = tl.where(is_in_topk, 0.0, float("-inf"))
+            #     attn_scores += sparse_mask[None, :, :]
 
         # softmax
         softmax_attn_i = tl.exp(attn_scores - m_i[:, :, None]) / d_i[:, :, None]
@@ -889,6 +903,45 @@ def _fwd_loss_kernel(
 
     # Store loss
     tl.store(Loss_ptr + b * stride_lb + aq * stride_ls, loss_i, mask=aq_valid)
+
+
+@triton.jit
+def _compute_sparse_mask_kernel(
+    Topk_Idx_ptr,
+    Out_Idx_ptr,
+    # Topk strides: [B, Sq, TopK]
+    stride_tb,
+    stride_ts,
+    stride_tk,
+    # Out strides: [B, Sq, Sk]
+    stride_ob,
+    stride_os,
+    stride_ok,
+    # Dimensions
+    Sq: tl.constexpr,
+    Sk: tl.constexpr,
+    BLOCK_SK: tl.constexpr,
+    TOPK: tl.constexpr,
+):
+    b = tl.program_id(0)
+    q_offs = tl.program_id(1)
+
+    for sk_start in tl.range(0, Sk, BLOCK_SK):
+        sk_offs = sk_start + tl.arange(0, BLOCK_SK)
+        sk_valid = sk_offs < Sk
+
+        topk_offs = tl.arange(0, TOPK)
+        topk_valid = topk_offs < TOPK
+        topk_idxs_ptrs = Topk_Idx_ptr + b * stride_tb + q_offs * stride_ts + topk_offs * stride_tk
+        topk_idxs = tl.load(topk_idxs_ptrs, mask=(q_offs < Sq) & topk_valid, other=0).to(tl.int32)
+
+        is_in_sk = (topk_idxs >= sk_start) & (topk_idxs < sk_start + BLOCK_SK)
+        topk_idxs = tl.where(is_in_sk, topk_idxs - sk_start, -1)
+        sparse_hist = tl.histogram(topk_idxs, BLOCK_SK, mask=(topk_idxs >= 0))
+        sparse_mask = tl.where(sparse_hist > 0, 0.0, float("-inf"))
+
+        out_ptrs = Out_Idx_ptr + b * stride_ob + q_offs * stride_os + sk_offs * stride_ok
+        tl.store(out_ptrs, sparse_mask, mask=sk_valid)
 
 
 def compute_dsa_indexer_loss_triton(
@@ -997,6 +1050,24 @@ def compute_dsa_indexer_loss_triton(
             HAS_MASK=has_mask,
         )
 
+        if sparse_loss:
+            index_mask = torch.empty((B, Sq, Sk), dtype=torch.float32, device=q.device)
+            sparse_grid = (B, Sq,)
+            _compute_sparse_mask_kernel[sparse_grid](
+                Topk_Idx_ptr=out_idx,
+                Out_Idx_ptr=index_mask,
+                stride_tb=out_idx.stride(0),
+                stride_ts=out_idx.stride(1),
+                stride_tk=out_idx.stride(2),
+                stride_ob=index_mask.stride(0),
+                stride_os=index_mask.stride(1),
+                stride_ok=index_mask.stride(2),
+                Sq=Sq,
+                Sk=Sk,
+                BLOCK_SK=BLOCK_SK,
+                TOPK=topk,
+            )
+
     Sq_offset = 0
     if pg_collection is not None and pg_collection.tp.size() > 1:
         tp_size = pg_collection.tp.size()
@@ -1062,6 +1133,13 @@ def compute_dsa_indexer_loss_triton(
     out_loss = torch.empty((B, ASq), dtype=torch.float32, device=q.device)
     attn_num_sq_blocks = (ASq + BLOCK_SQ - 1) // BLOCK_SQ
     attn_grid = (B, attn_num_sq_blocks,)
+
+    if sparse_loss:
+        stride_imb = index_mask.stride(0)
+        stride_ims = index_mask.stride(1)
+        stride_imk = index_mask.stride(2)
+    else:
+        stride_imb = stride_ims = stride_imk = 0
     
     _fwd_loss_kernel[attn_grid](
         Q_ptr=q,
@@ -1072,6 +1150,7 @@ def compute_dsa_indexer_loss_triton(
         Attn_Query_ptr=attn_query,
         Attn_Key_ptr=attn_key,
         Loss_ptr=out_loss,
+        Index_Mask_ptr=index_mask,
         # Q strides
         stride_qs=q.stride(0),
         stride_qb=q.stride(1),
@@ -1106,6 +1185,10 @@ def compute_dsa_indexer_loss_triton(
         # Loss strides: [B, Sq]
         stride_lb=out_loss.stride(0),
         stride_ls=out_loss.stride(1),
+        # Index mask strides: [B, Sq, Sk]
+        stride_imb=stride_imb,
+        stride_ims=stride_ims,
+        stride_imk=stride_imk,
         # Dimensions
         H=H,
         D=D,
