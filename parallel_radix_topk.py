@@ -33,6 +33,17 @@ def convert_to_uint16(x):
     
     return bits_uint
 
+@triton.jit
+def convert_to_uint32(x):
+    fval = x.cast(tl.float32)
+    bits_uint = fval.cast(tl.uint32, bitcast=True)
+    bits_uint = tl.where(
+        x < 0, 
+        ~bits_uint & tl.full((1,), 0xFFFFFFFF, dtype=tl.uint32), 
+        bits_uint | tl.full((1,), 0x80000000, dtype=tl.uint32)
+    )
+    return bits_uint
+
 
 @triton.jit
 def test_convert_kernel(
@@ -77,10 +88,17 @@ def test_convert_kernel(
     # TODO: maybe need BLOCK_SIZE for loading
     x_ptrs = x_ptr + tl.arange(0, N) * stride_n
     x = tl.load(x_ptrs, mask=tl.arange(0, N) < N, other=0.0)
+    x_idx = tl.arange(0, N)
+    x_dtype = x.dtype
 
+    # # initialize
+    # tl.store(s_out_vals_ptr, x, mask=tl.arange(0, N) < N)
+    # tl.store(s_out_idxs_ptr, x_idx, mask=tl.arange(0, N) < N)
+    # l_new_topk = TOPK_THRESHOLD
+
+    # Stage-1: coarse-grained topk selection
     # consider the first 8 bits
     uint16_x = convert_to_uint16(x)
-    x_idx = tl.arange(0, N)
 
     # 256 = 2^8
     histogram = tl.histogram(uint16_x.cast(tl.int32), 256)
@@ -110,7 +128,7 @@ def test_convert_kernel(
             tl.store(out_vals_ptr + out_ptr_offset * stride_on, val)
             tl.store(out_idxs_ptr + out_ptr_offset * stride_oi, idx)
             tl.store(position_ptr + (uint16_val + 1) * stride_position, out_ptr_offset + 1, mask=(uint16_val + 1) < 256)
-            tl.device_print("increases by 1: ", out_ptr_offset)
+            # tl.device_print("increases by 1: ", out_ptr_offset)
 
     # equal to threshold, to fine-grained selection
     eq_mask = (uint16_x.cast(tl.int32) == bin_threshold)
@@ -122,47 +140,96 @@ def test_convert_kernel(
         if is_valid:
             val = tl.load(x_ptr + i * stride_n)
             idx = tl.load(index_ptr + i * stride_index)
-            tl.store(s_out_vals_ptr + sout_ptr_offset * stride_son, val)
+            tl.store(s_out_vals_ptr + sout_ptr_offset * stride_son, val.to(x_dtype))
             tl.store(s_out_idxs_ptr + sout_ptr_offset * stride_soi, idx)
             sout_ptr_offset += 1
     tl.store(s_num_input_ptr, sout_ptr_offset)
 
     # Stage-2: fine-grained topk selection
-    remaining_topk = tl.sum(eq_mask)
-    if remaining_topk == 0:
+    l_new_topk = tl.sum(eq_mask)
+    if l_new_topk == 0:
         return
 
-    l_new_topk = tl.sum(gt_mask)
     for round in tl.static_range(4):
-        if l_new_topk <= 0:
-            # TODO: break is not supported
-            break
+        if l_new_topk > 0:
+            # interleaved buffer
+            r_idx = round % 2
 
-        # interleaved buffer
-        r_idx = round % 2
+            # compute the start position of the current round
+            l_start_pos = TOPK_THRESHOLD - l_new_topk
 
-        # compute the start position of the current round
-        l_start_pos = TOPK_THRESHOLD - l_new_topk
+            # clean up buffer
+            tl.store(position_ptr + tl.arange(0, 256) * stride_position, tl.zeros((256,), dtype=tl.int32), mask=tl.arange(0, 256) < 256)
+            tl.store(s_num_input_ptr + (r_idx ^ 1) * stride_s_num_input, 0)
 
-        # clean up buffer
-        tl.store(position_ptr + tl.arange(0, 256) * stride_position, tl.zeros(256, dtype=tl.int32), mask=tl.arange(0, 256) < 256)
-        # TODO: tl.store(s_num_input_ptr, 0)
+            l_num_input = tl.load(s_num_input_ptr + r_idx * stride_s_num_input)
 
-        l_num_input = tl.load(s_num_input_ptr + r_idx * stride_s_num_input)
+            # build current 8-bit histogram
+            cur_x = tl.load(s_out_vals_ptr + tl.arange(0, N) * stride_son)
+            cur_uint32_x = convert_to_uint32(cur_x)
+            cur_8bit_x = ((cur_uint32_x >> (24 - round * 8)) & (0xFF)).cast(tl.int32)
+            cur_histogram = tl.histogram(cur_8bit_x, 256)
 
-        # build current 8-bit histogram
-        current_x = tl.load(s_out_vals_ptr + tl.arange(0, N) * stride_son)
-        current_uint16_x = convert_to_uint16(current_x)
-        current_uint16_x = ((current_uint16_x >> (24 - round * 8)) & 0xFF)
-        current_histogram = tl.histogram(current_uint16_x.cast(tl.int32), 256)
+            # prefix sum
+            cur_cumsum_histogram = tl.cumsum(cur_histogram, reverse=True)
 
-        # prefix sum
-        current_cumsum_histogram = tl.cumsum(current_histogram, reverse=True)
+            # find new bin threshold
+            tl.store(hist_ptr + tl.arange(0, 256) * stride_hist, cur_cumsum_histogram, mask=tl.arange(0, 256) < 256)
+            cur_offset_histogram = tl.load(position_ptr + (tl.arange(0, 256) + 1) * stride_position, mask=tl.arange(0, 256) < 256, other=0)
+            cur_threshold_mask = (cur_cumsum_histogram > l_new_topk) & (cur_offset_histogram <= l_new_topk + 1)
+            cur_bin_threshold = tl.max(tl.where(cur_threshold_mask, tl.arange(0, 256), -1))
+            tl.store(s_bin_threshold_ptr, cur_bin_threshold)
 
-        # find new bin threshold
-        threshold_mask = (current_cumsum_histogram > TOPK_THRESHOLD) & (offset_histogram <= TOPK_THRESHOLD + 1)
-        current_bin_threshold = tl.max(tl.where(threshold_mask, tl.arange(0, 256), -1))
+            # greater than threshold, to output
+            cur_gt_mask = (cur_8bit_x > cur_bin_threshold)
+            tl.store(mask_ptr + tl.arange(0, N) * stride_mask, cur_gt_mask, mask=tl.arange(0, N) < N)
+            tl.store(index_ptr + tl.arange(0, N) * stride_index, x_idx, mask=tl.arange(0, N) < N)
+            tl.store(position_ptr + tl.arange(0, 256) * stride_position, cur_cumsum_histogram, mask=tl.arange(0, 256) < 256)
+            tl.store(uint16_x_ptr + tl.arange(0, N) * stride_uint16_x, cur_8bit_x, mask=tl.arange(0, N) < N)
+            for i in tl.static_range(0, N):
+                is_valid = tl.load(mask_ptr + i * stride_mask)
+                if is_valid:
+                    bit_val = tl.load(uint16_x_ptr + i * stride_uint16_x).to(tl.int32)
+                    val = tl.load(x_ptr + i * stride_n)
+                    idx = tl.load(index_ptr + i * stride_index)
+                    out_ptr_offset = tl.load(position_ptr + (bit_val + 1) * stride_position, mask=(bit_val + 1) < 256, other=0)
+                    # skip the previous topk elements
+                    out_ptr_offset += l_start_pos
+                    tl.store(out_vals_ptr + out_ptr_offset * stride_on, val.to(x_dtype), mask=out_ptr_offset < N)
+                    tl.store(out_idxs_ptr + out_ptr_offset * stride_oi, idx, mask=out_ptr_offset < N)
+                    tl.store(position_ptr + (bit_val + 1) * stride_position, out_ptr_offset + 1, mask=(bit_val + 1) < 256)
 
+            # equal to threshold, to fine-grained selection
+            cur_eq_mask = (cur_8bit_x == cur_bin_threshold)
+            l_new_topk = tl.sum(cur_eq_mask)
+            if l_new_topk > 0:
+                tl.store(mask_ptr + tl.arange(0, N) * stride_mask, cur_eq_mask, mask=tl.arange(0, N) < N)
+                tl.store(index_ptr + tl.arange(0, N) * stride_index, x_idx, mask=tl.arange(0, N) < N)
+                if round == 3:
+                    for i in tl.static_range(0, N):
+                        is_valid = tl.load(mask_ptr + i * stride_mask)
+                        if is_valid:
+                            bit_val = tl.load(uint16_x_ptr + i * stride_uint16_x).to(tl.int32)
+                            val = tl.load(x_ptr + i * stride_n)
+                            idx = tl.load(index_ptr + i * stride_index)
+                            out_ptr_offset = tl.load(position_ptr + (bit_val + 1) * stride_position, mask=(bit_val + 1) < 256, other=0)
+                            # skip the previous topk elements
+                            out_ptr_offset += l_start_pos
+                            if out_ptr_offset < TOPK_THRESHOLD:
+                                tl.store(out_vals_ptr + out_ptr_offset * stride_on, val.to(x_dtype), mask=out_ptr_offset < N)
+                                tl.store(out_idxs_ptr + out_ptr_offset * stride_oi, idx, mask=out_ptr_offset < N)
+                                tl.store(position_ptr + (bit_val + 1) * stride_position, out_ptr_offset + 1, mask=(bit_val + 1) < 256)
+                else:
+                    sout_ptr_offset = 0
+                    for i in tl.static_range(0, N):
+                        is_valid = tl.load(mask_ptr + i * stride_mask)
+                        if is_valid:
+                            val = tl.load(x_ptr + i * stride_n)
+                            idx = tl.load(index_ptr + i * stride_index)
+                            tl.store(s_out_vals_ptr + sout_ptr_offset * stride_son, val.to(x_dtype), mask=sout_ptr_offset < N)
+                            tl.store(s_out_idxs_ptr + sout_ptr_offset * stride_soi, idx, mask=sout_ptr_offset < N)
+                            sout_ptr_offset += 1
+                    # tl.store(s_num_input_ptr, sout_ptr_offset)
 
 
 if __name__ == "__main__":
@@ -183,7 +250,8 @@ if __name__ == "__main__":
     s_out_vals = torch.zeros(256, device='cuda', dtype=x.dtype)
     s_out_idxs = torch.zeros(256, device='cuda', dtype=torch.int32)
     s_bin_threshold = torch.zeros(1, device='cuda', dtype=torch.int32)
-    TOPK_THRESHOLD = 7
+    s_num_input = torch.zeros(2, device='cuda', dtype=torch.int32)
+    TOPK_THRESHOLD = 9
     test_convert_kernel[(1, )](
         x_ptr=x,
         stride_n=x.stride(0),
@@ -230,6 +298,10 @@ if __name__ == "__main__":
         uint16_x_ptr=uint16_x,
         stride_uint16_x=uint16_x.stride(0),
         UINT16_X_N=uint16_x.shape[0],
+
+        s_num_input_ptr=s_num_input,
+        stride_s_num_input=s_num_input.stride(0),
+        S_NUM_INPUT_N=s_num_input.shape[0],
     )
     print(f"{x=}")
     print(f"{out_vals=}")
