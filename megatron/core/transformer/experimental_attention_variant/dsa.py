@@ -612,6 +612,144 @@ class DSAIndexer(MegatronModule):
 
         return index_scores, topk_indices
 
+    def forward_with_scores_and_loss(
+        self,
+        x: torch.Tensor,
+        qr: torch.Tensor,
+        # params for loss
+        query: torch.Tensor,
+        key: torch.Tensor,
+        softmax_scale: float,
+        loss_coeff: float,
+        sparse_loss: bool,
+        # params for topk
+        mask: Optional[torch.Tensor] = None,
+        packed_seq_params: Optional[PackedSeqParams] = None,
+    ):
+        """
+        Forward pass for DSA Indexer that returns top-k indices and KL loss divergence loss between index_scores and true attention_scores.
+
+        This loss trains the indexer to predict which tokens are important by matching the distribution
+        of true attention scores.
+
+        Reference: Section 2.1 of
+            https://github.com/deepseek-ai/DeepSeek-V3.2-Exp/blob/main/DeepSeek_V3_2.pdf
+
+        To avoid seq * seq scores, we compute the top-k indices and KL loss in one forward pass.
+
+        Args:
+            x: hidden states [seqlen, batch, hidden_size].
+            qr: Low-rank query tensor [seqlen, batch, q_lora_rank].
+            query: Query tensor [seqlen_q, batch, heads, dim].
+            key: Key tensor [seqlen_k, batch, heads, dim].
+            softmax_scale: Scale coefficient after q @ k^T.
+            loss_coeff: Coefficient for the indexer KL divergence loss.
+            sparse_loss: bool, whether to use sparse indexer loss. If True, only the topk
+                indices will be used to compute the loss.
+            mask: Attention mask [batch, seqlen, seqlen].
+            packed_seq_params: Packed sequence parameters for variable length sequences.
+
+        Returns:
+            topk_indices: Top-k indices [batch, seqlen, index_topk].
+            index_loss: KL divergence loss (scalar).
+        """
+        assert packed_seq_params is None, "Packed sequence is not supported for DSAttention"
+
+        # =========================================
+        # Prepare RoPE params
+        # =========================================
+        rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
+            None, None, x, self.config, packed_seq_params
+        )
+        if self.config.rope_type == "rope":
+            rotary_pos_emb = self.rotary_pos_emb(rotary_seq_len, packed_seq=False)
+            mscale = 1.0
+        else:
+            rotary_pos_emb, mscale = self.rotary_pos_emb(rotary_seq_len, packed_seq=False)
+
+        # =========================================
+        # Gather inputs if sp is enabled
+        # =========================================
+        if self.config.sequence_parallel and self.pg_collection.tp.size() > 1:
+            x = gather_from_sequence_parallel_region(x, group=self.pg_collection.tp)
+            qr = gather_from_sequence_parallel_region(qr, group=self.pg_collection.tp)
+
+        # =========================================
+        # Get sequence length and batch size
+        # =========================================
+        seqlen, bsz, _ = x.size()
+
+        # =========================================
+        # q linear and apply rope to q
+        # =========================================
+        # [seqlen, batch, q_lora_rank] -> [seqlen, batch, index_n_heads * index_head_dim]
+        q, _ = self.linear_wq_b(qr)
+        # [seqlen, batch, index_n_heads * index_head_dim]
+        #   -> [seqlen, batch, index_n_heads, index_head_dim]
+        q = q.reshape(seqlen, bsz, self.index_n_heads, self.index_head_dim)
+        q = self._apply_rope(q, rotary_pos_emb, mscale)
+
+        # =========================================
+        # k linear and apply rope to k
+        # =========================================
+        # [seqlen, batch, hidden_size] -> [seqlen, batch, index_head_dim]
+        k, _ = self.linear_wk(x)
+        k = self.k_norm(k)
+        # [seqlen, batch, index_head_dim] -> [seqlen, batch, 1, index_head_dim]
+        k = k.reshape(seqlen, bsz, 1, self.index_head_dim)
+        k = self._apply_rope(k, rotary_pos_emb, mscale)
+        # [seqlen, batch, 1, index_head_dim] -> [seqlen, batch, index_head_dim]
+        k = k.reshape(seqlen, bsz, self.index_head_dim)
+
+        # =========================================
+        # Rotate activation
+        # =========================================
+        q = rotate_activation(q)
+        k = rotate_activation(k)
+
+        # =========================================
+        # Compute index scores
+        # =========================================
+        # [seqlen, batch, hidden_size] -> [seqlen, batch, index_n_heads]
+        weights, _ = self.linear_weights_proj(x)
+        weights = weights * (self.index_n_heads**-0.5) * self.softmax_scale
+        
+        def compute_index_scores_with_topk():
+            # [batch, seqlen, seqlen]
+            index_scores = self._compute_index_scores(q, weights, k)
+            if mask is not None:
+                assert mask.dtype == index_scores.dtype, "Mask dtype must match index scores dtype"
+                index_scores = index_scores + mask
+
+            # =========================================
+            # Select top-k indices
+            # =========================================
+            topk_k = min(self.index_topk, seqlen)
+            # [batch, seqlen, index_topk]
+            topk_indices = index_scores.topk(topk_k, dim=-1)[1]
+
+            # =========================================
+            # Compute indexer loss
+            # =========================================
+            pg_collection: ProcessGroupCollection = self.pg_collection
+
+            indexer_loss = compute_dsa_indexer_loss(
+                index_scores,
+                topk_indices,
+                query,
+                key,
+                softmax_scale,
+                loss_coeff,
+                sparse_loss,
+                pg_collection,
+            )
+
+            return topk_indices, indexer_loss
+
+        topk_indices, indexer_loss = compute_index_scores_with_topk()
+
+        return topk_indices, indexer_loss
+
     def forward(
         self,
         x: torch.Tensor,
