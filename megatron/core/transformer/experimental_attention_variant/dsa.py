@@ -296,15 +296,17 @@ def compute_dsa_indexer_loss_triton(
         index_mask = torch.full(
             (b, sq, sk), float("-inf"), dtype=torch.float32, device=index_scores.device
         ).scatter_(-1, topk_indices, 0)
+    else:
+        index_mask = None
 
     loss = fwd_fused_indexer_loss(
         index_scores,
-        index_mask,
         query,
         key,
         softmax_scale,
         loss_coeff,
         sparse_loss,
+        index_mask,
         Sq_offset,
         full_Sq,
     )
@@ -408,7 +410,7 @@ def tensor_parallel_preprocessing(
 ):
     """TP preprocessing for Triton fused indexer loss."""
     Sq_offset = 0
-    full_Sq = 0
+    full_Sq = query.size(0)
 
     if pg_collection is not None and pg_collection.tp.size() > 1:
         full_Sq, AB, scatter_H, AD = query.shape
