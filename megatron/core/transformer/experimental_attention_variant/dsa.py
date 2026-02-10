@@ -20,12 +20,15 @@ from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.experimental_attention_variant.fused_loss import fwd_fused_indexer_loss
 
 try:
     from fast_hadamard_transform import hadamard_transform
 except ImportError:
     hadamard_transform = None
 
+import os
+DSA_TRITON_LOSS = os.environ.get("DSA_TRITON_LOSS", "false").lower() == "true"
 
 def rotate_activation(x: torch.Tensor) -> torch.Tensor:
     """Apply Hadamard rotation activation.
@@ -252,6 +255,63 @@ def compute_dsa_indexer_loss(
     return indexer_loss
 
 
+def compute_dsa_indexer_loss_triton(
+    index_scores: torch.Tensor,
+    topk_indices: torch.Tensor,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    softmax_scale: float,
+    loss_coeff: float,
+    sparse_loss: bool,
+    Sq_offset: int,
+    full_Sq: int,
+) -> torch.Tensor:
+    """
+    Compute KL divergence loss between index_scores and true attention_scores.
+
+    This loss trains the indexer to predict which tokens are important by matching the distribution
+    of true attention scores.
+
+    Reference: Section 2.1 of
+        https://github.com/deepseek-ai/DeepSeek-V3.2-Exp/blob/main/DeepSeek_V3_2.pdf
+
+    Args:
+        index_scores: Scores predicted by indexer [batch, seqlen_q, seqlen_k].
+        topk_indices: Top-k indices [batch, seqlen_q, index_topk].
+        query: Query tensor [seqlen_q, batch, heads, dim].
+        key: Key tensor [seqlen_k, batch, heads, dim].
+        softmax_scale: Scale coefficient after q @ k^T.
+        loss_coeff: Coefficient for the indexer KL divergence loss.
+        sparse_loss: bool, whether to use sparse indexer loss. If True, only the topk
+            indices will be used to compute the loss.
+        pg_collection: Process group collection, must have TP process group.
+
+    Returns:
+        index_loss: KL divergence loss (scalar).
+    """
+    sq, b, np, hn = query.size()
+    sk = key.size(0)
+
+    if sparse_loss:
+        index_mask = torch.full(
+            (b, sq, sk), float("-inf"), dtype=torch.float32, device=index_scores.device
+        ).scatter_(-1, topk_indices, 0)
+
+    loss = fwd_fused_indexer_loss(
+        index_scores,
+        index_mask,
+        query,
+        key,
+        softmax_scale,
+        loss_coeff,
+        sparse_loss,
+        Sq_offset,
+        full_Sq,
+    )
+
+    return loss
+
+
 def _compute_index_scores(q: torch.Tensor, weights: torch.Tensor, k: torch.Tensor) -> torch.Tensor:
     """
     Perform index score using BF16 precision.
@@ -338,6 +398,90 @@ def fwd_fused_indexer_loss_naive(
         loss_coeff,
         sparse_loss,
         pg_collection,
+    )
+
+    return topk_indices, indexer_loss
+
+
+def tensor_parallel_preprocessing(
+    query, key, pg_collection
+):
+    """TP preprocessing for Triton fused indexer loss."""
+    Sq_offset = 0
+    full_Sq = 0
+
+    if pg_collection is not None and pg_collection.tp.size() > 1:
+        full_Sq, AB, scatter_H, AD = query.shape
+        tp_size = pg_collection.tp.size()
+
+        # all-to-all for attn query
+        assert full_Sq % tp_size == 0, f"full_Sq {full_Sq} % tp_size {tp_size} != 0"
+        scatter_Sq = full_Sq // tp_size
+        full_H = scatter_H * tp_size
+
+        # [full_Sq, B, H, D] -> [tp_size, H, full_Sq // tp_size, B, D]
+        view_attn_q = (
+            query.permute(2, 0, 1, 3)
+            .reshape(scatter_H, tp_size, scatter_Sq, AB, AD)
+            .transpose(0, 1)
+            .contiguous()
+        )
+        output_attn_q = torch.empty_like(view_attn_q)
+        torch.distributed.dist.all_to_all_single(
+            output_attn_q, 
+            view_attn_q,
+            group=pg_collection.tp
+        )
+        # [tp_size, H, full_Sq // tp_size, B, D] -> [full_Sq // tp_size, B, H * tp_size, D]
+        query = (
+            output_attn_q.reshape(full_H, scatter_Sq, AB, AD)
+            .permute(1, 2, 0, 3)
+            .contiguous()
+        )
+
+        # all-gather for attn key
+        Sk = key.shape[0]
+        scatter_Hk = key.shape[2]
+        full_Hk = scatter_Hk * tp_size
+
+        gathered_attn_k = torch.empty(
+            (tp_size, Sk, AB, scatter_Hk, AD), 
+            device=key.device, 
+            dtype=key.dtype
+        )
+        torch.distributed.all_gather_into_tensor(gathered_attn_k, key.contiguous(), group=pg_collection.tp)
+        # [tp_size, Sk, B, H, D] -> [Sk, B, H * tp_size, D]
+        key = (
+            gathered_attn_k.permute(1, 2, 0, 3, 4)
+            .reshape(Sk, AB, full_Hk, AD)
+            .contiguous()
+        )
+
+        # Do not split index scores, it introduces extra problem in communication and casual mask
+        # Sq should be within (Sq_offset, Sq_offset + Sq)
+        tp_rank = pg_collection.tp.rank()
+        Sq_offset = full_Sq // tp_size * tp_rank
+        assert Sq_offset + scatter_Sq <= full_Sq
+
+    return query, key, Sq_offset, full_Sq
+
+
+def fwd_fused_indexer_loss_triton(
+    q, weights, k, query, key, topk, softmax_scale, loss_coeff, mask, sparse_loss, Sq_offset, full_Sq,
+):
+    """Triton implementation of forward pass for indexer loss."""
+    index_scores, topk_indices = fused_qk_topk_naive(q, k, weights, topk, mask)
+
+    indexer_loss = compute_dsa_indexer_loss_triton(
+        index_scores,
+        topk_indices,
+        query,
+        key,
+        softmax_scale,
+        loss_coeff,
+        sparse_loss,
+        Sq_offset, 
+        full_Sq,
     )
 
     return topk_indices, indexer_loss
@@ -528,19 +672,38 @@ class FusedDSAIndexerLoss(torch.autograd.Function):
         """
         Fused forward: index_scores never materialized in full.
         """
-        topk_indices, loss = fwd_fused_indexer_loss_naive(
-            q,
-            weights,
-            k,
-            query,
-            key,
-            topk,
-            softmax_scale,
-            loss_coeff,
-            mask,
-            sparse_loss,
-            pg_collection,
-        )
+        if DSA_TRITON_LOSS:
+            # tensor parallel
+            query, key, Sq_offset, full_Sq = tensor_parallel_preprocessing(query, key, pg_collection)
+
+            topk_indices, loss = fwd_fused_indexer_loss_triton(
+                q,
+                weights,
+                k,
+                query,
+                key,
+                topk,
+                softmax_scale,
+                loss_coeff,
+                mask,
+                sparse_loss,
+                Sq_offset,
+                full_Sq,
+            )
+        else:
+            topk_indices, loss = fwd_fused_indexer_loss_naive(
+                q,
+                weights,
+                k,
+                query,
+                key,
+                topk,
+                softmax_scale,
+                loss_coeff,
+                mask,
+                sparse_loss,
+                pg_collection,
+            )
 
         # Save for backward (recomputation strategy)
         ctx.save_for_backward(q, weights, k, query, key, topk_indices)
