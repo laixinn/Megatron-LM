@@ -7,8 +7,18 @@ import torch.distributed as dist
 import triton
 import triton.language as tl
 
-from megatron.core.process_groups_config import ProcessGroupCollection
-
+@triton.autotune(
+    configs=[
+        triton.Config({"BLOCK_D": BLOCK_D, "BLOCK_SK": BLOCK_SK, "BLOCK_SQ": BLOCK_SQ}, num_warps=num_warps, num_stages=num_stages)
+        for BLOCK_D in [16]
+        for BLOCK_SK in [16]
+        for BLOCK_SQ in [4]
+        for num_warps in [8]
+        for num_stages in [3]
+    ],
+    key=["AH", "Sk", "ASq"],
+    cache_results=True,
+)
 @triton.jit
 def _fwd_fused_indexer_loss_kernel(
     Attn_Query_ptr,
@@ -47,6 +57,7 @@ def _fwd_fused_indexer_loss_kernel(
     BLOCK_SQ: tl.constexpr,
     BLOCK_SK: tl.constexpr,
     BLOCK_D: tl.constexpr,
+    BLOCK_AH: tl.constexpr,
     SPARSE_LOSS: tl.constexpr,
     Softmax_Scale: tl.constexpr,
 ):
@@ -94,26 +105,25 @@ def _fwd_fused_indexer_loss_kernel(
 
         # first pass for attn softmax
         attn_scores = tl.zeros([AH, BLOCK_SQ, BLOCK_SK], dtype=tl.float32)
-        for h in tl.range(AH):
-            aq_head_base = aq_base + h * stride_aqh
-            ak_head_base = ak_base + h * stride_akh
+        # Vectorize across heads for parallel computation
+        for d_start in tl.range(0, AD, BLOCK_D):
+            d_offs = d_start + tl.arange(0, BLOCK_D)
+            d_valid = d_offs < AD
 
-            dot = tl.zeros([BLOCK_SQ, BLOCK_SK], dtype=tl.float32)
-            for d_start in tl.range(0, AD, BLOCK_D):
-                d_offs = d_start + tl.arange(0, BLOCK_D)
-                d_valid = d_offs < AD
+            # Load all heads at once: [AH, BLOCK_SQ, BLOCK_D]
+            aq_ptrs = aq_base + h_ids[:, None, None] * stride_aqh + aq[None, :, None] * stride_asq + d_offs[None, None, :] * stride_aqd
+            aq_vals = tl.load(aq_ptrs, mask=(h_ids[:, None, None] < AH) & (aq_valid[None, :, None] & d_valid[None, None, :]), other=0.0)
 
-                aq_ptrs = aq_head_base + aq[:, None] * stride_asq + d_offs[None, :] * stride_aqd
-                ak_ptrs = ak_head_base + sk_offs[None, :] * stride_ask + d_offs[:, None] * stride_akd
+            # Load all heads at once: [AH, BLOCK_D, BLOCK_SK] (transposed pattern matches original)
+            ak_ptrs = ak_base + h_ids[:, None, None] * stride_akh + sk_offs[None, None, :] * stride_ask + d_offs[None, :, None] * stride_akd
+            ak_vals = tl.load(ak_ptrs, mask=(h_ids[:, None, None] < AH) & (sk_valid[None, None, :] & d_valid[None, :, None]), other=0.0)
 
-                aq_vals = tl.load(aq_ptrs, mask=(aq_valid[:, None] & d_valid[None, :]), other=0.0)
-                ak_vals = tl.load(ak_ptrs, mask=(sk_valid[None, :] & d_valid[:, None]), other=0.0)
+            # Compute batched matrix multiplication: [AH, BLOCK_SQ, BLOCK_D] @ [AH, BLOCK_D, BLOCK_SK] -> [AH, BLOCK_SQ, BLOCK_SK]
+            # Using element-wise multiplication and sum over dimension D
+            # attn_scores += tl.sum(aq_vals[:, :, :, None] * ak_vals[:, None, :, :], axis=2)
+            attn_scores += tl.dot(aq_vals, ak_vals)
 
-                dot += tl.dot(aq_vals, ak_vals)
-
-            dot *= Softmax_Scale
-
-            attn_scores = tl.where(h_ids[:, None, None] == h, dot[None, :, :], attn_scores)
+        attn_scores *= Softmax_Scale
 
         # apply causal mask
         casual_mask = tl.full([BLOCK_SQ, BLOCK_SK], float("-inf"), dtype=tl.float32)
@@ -141,26 +151,25 @@ def _fwd_fused_indexer_loss_kernel(
             index_scores += index_mask
 
         attn_scores = tl.zeros([AH, BLOCK_SQ, BLOCK_SK], dtype=tl.float32)
-        for h in tl.range(AH):
-            aq_head_base = aq_base + h * stride_aqh
-            ak_head_base = ak_base + h * stride_akh
+        # Vectorize across heads for parallel computation
+        for d_start in tl.range(0, AD, BLOCK_D):
+            d_offs = d_start + tl.arange(0, BLOCK_D)
+            d_valid = d_offs < AD
 
-            dot = tl.zeros([BLOCK_SQ, BLOCK_SK], dtype=tl.float32)
-            for d_start in tl.range(0, AD, BLOCK_D):
-                d_offs = d_start + tl.arange(0, BLOCK_D)
-                d_valid = d_offs < AD
+            # Load all heads at once: [AH, BLOCK_SQ, BLOCK_D]
+            aq_ptrs = aq_base + h_ids[:, None, None] * stride_aqh + aq[None, :, None] * stride_asq + d_offs[None, None, :] * stride_aqd
+            aq_vals = tl.load(aq_ptrs, mask=(h_ids[:, None, None] < AH) & (aq_valid[None, :, None] & d_valid[None, None, :]), other=0.0)
 
-                aq_ptrs = aq_head_base + aq[:, None] * stride_asq + d_offs[None, :] * stride_aqd
-                ak_ptrs = ak_head_base + sk_offs[None, :] * stride_ask + d_offs[:, None] * stride_akd
+            # Load all heads at once: [AH, BLOCK_D, BLOCK_SK] (transposed pattern matches original)
+            ak_ptrs = ak_base + h_ids[:, None, None] * stride_akh + sk_offs[None, None, :] * stride_ask + d_offs[None, :, None] * stride_akd
+            ak_vals = tl.load(ak_ptrs, mask=(h_ids[:, None, None] < AH) & (sk_valid[None, None, :] & d_valid[None, :, None]), other=0.0)
 
-                aq_vals = tl.load(aq_ptrs, mask=(aq_valid[:, None] & d_valid[None, :]), other=0.0)
-                ak_vals = tl.load(ak_ptrs, mask=(sk_valid[None, :] & d_valid[:, None]), other=0.0)
+            # Compute batched matrix multiplication: [AH, BLOCK_SQ, BLOCK_D] @ [AH, BLOCK_D, BLOCK_SK] -> [AH, BLOCK_SQ, BLOCK_SK]
+            # Using element-wise multiplication and sum over dimension D
+            # attn_scores += tl.sum(aq_vals[:, :, :, None] * ak_vals[:, None, :, :], axis=2)
+            attn_scores += tl.dot(aq_vals, ak_vals)
 
-                dot += tl.dot(aq_vals, ak_vals)
-
-            dot *= Softmax_Scale
-
-            attn_scores = tl.where(h_ids[:, None, None] == h, dot[None, :, :], attn_scores)
+        attn_scores *= Softmax_Scale
 
         # apply causal mask
         casual_mask = tl.full([BLOCK_SQ, BLOCK_SK], float("-inf"), dtype=tl.float32)
@@ -200,16 +209,19 @@ def fwd_fused_indexer_loss(
     ASk = attn_key.shape[0]
 
     # This kernel performs badly when AH is larger than 16.
-    if AH <= 16:
-        BLOCK_SK = 64
-    else:
-        BLOCK_SK = 16
-    BLOCK_SQ = 16
-    BLOCK_D  = 64
+    # if AH <= 16:
+    #     BLOCK_SK = 64
+    # else:
+    #     BLOCK_SK = 16
+    BLOCK_SK = 16
+    BLOCK_SQ = 8
+    BLOCK_D  = 16
+    BLOCK_AH = 8
 
     out_loss = torch.empty((AB, ASq), dtype=torch.float32, device=attn_query.device)
     attn_num_sq_blocks = (ASq + BLOCK_SQ - 1) // BLOCK_SQ
-    attn_grid = (AB, attn_num_sq_blocks,)
+    # attn_grid = (AB, attn_num_sq_blocks,)
+    attn_grid = (AB, ASq, )
 
     if sparse_loss:
         stride_imb = index_mask.stride(0)
@@ -253,9 +265,10 @@ def fwd_fused_indexer_loss(
         ASq=ASq,
         Sq=full_Sq,
         Sq_offset=Sq_offset,
-        BLOCK_SQ=BLOCK_SQ,
-        BLOCK_SK=BLOCK_SK,
-        BLOCK_D=BLOCK_D,
+        # BLOCK_SQ=BLOCK_SQ,
+        # BLOCK_SK=BLOCK_SK,
+        # BLOCK_D=BLOCK_D,
+        BLOCK_AH=BLOCK_AH,
         SPARSE_LOSS=sparse_loss,
         Softmax_Scale=softmax_scale,
     )
