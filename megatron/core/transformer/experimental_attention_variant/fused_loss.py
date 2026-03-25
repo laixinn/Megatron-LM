@@ -24,6 +24,8 @@ def _fwd_fused_indexer_loss_stage1_kernel(
     Index_Mask_ptr,
     m_ptr,
     d_ptr,
+    m1_ptr,
+    d1_ptr,
     # Attn query strides: [Sq, B, H, D]
     stride_asq,
     stride_aqb,
@@ -53,6 +55,12 @@ def _fwd_fused_indexer_loss_stage1_kernel(
     stride_smdb,
     stride_smdh,
     stride_smdq,
+    # softmax m1 strides: [B, Sq]
+    stride_sm1b,
+    stride_sm1q,
+    # softmax dd strides: [B, Sq]
+    stride_sd1b,
+    stride_sd1q,
     # Dimensions
     AH: tl.constexpr,
     AD: tl.constexpr,
@@ -99,11 +107,12 @@ def _fwd_fused_indexer_loss_stage1_kernel(
             index_mask = tl.load(index_mask_ptrs, mask=(sq_valid[:, None] & sk_valid[None, :]), other=float("-inf"))
             index_scores += index_mask
 
-        # first pass for index softmax
-        m1_i_1 = m1_i
-        m1_i = tl.maximum(m1_i, tl.max(index_scores, axis=1))
-        m1_i = tl.where(m1_i <= float("-inf"), 0.0, m1_i)
-        d1_i = d1_i * tl.exp(m1_i_1 - m1_i) + tl.exp(index_scores - m1_i[:, None]).sum(axis=1)
+        if h == 0:
+            # first pass for index softmax
+            m1_i_1 = m1_i
+            m1_i = tl.maximum(m1_i, tl.max(index_scores, axis=1))
+            m1_i = tl.where(m1_i <= float("-inf"), 0.0, m1_i)
+            d1_i = d1_i * tl.exp(m1_i_1 - m1_i) + tl.exp(index_scores - m1_i[:, None]).sum(axis=1)
 
         casual_mask = tl.full([BLOCK_SQ, BLOCK_SK], float("-inf"), dtype=tl.float32)
         casual_mask = tl.where((sq[:, None] < sk_offs[None, :]), casual_mask, 0.0)
@@ -141,6 +150,10 @@ def _fwd_fused_indexer_loss_stage1_kernel(
         tl.store(m_ptr + b * stride_smmb + h * stride_smmh + sq * stride_smmq, m_i, mask=sq_valid)
         tl.store(d_ptr + b * stride_smdb + h * stride_smdh + sq * stride_smdq, d_i, mask=sq_valid)
 
+    if h == 0:
+        tl.store(m1_ptr + b * stride_sm1b + sq * stride_sm1q, m1_i, mask=sq_valid)
+        tl.store(d1_ptr + b * stride_sd1b + sq * stride_sd1q, d1_i, mask=sq_valid)
+
 @triton.jit
 def _fwd_fused_indexer_loss_stage2_kernel(
     Attn_Query_ptr,
@@ -150,6 +163,8 @@ def _fwd_fused_indexer_loss_stage2_kernel(
     Index_Mask_ptr,
     m_ptr,
     d_ptr,
+    m1_ptr,
+    d1_ptr,
     # Attn query strides: [Sq, B, H, D]
     stride_asq,
     stride_aqb,
@@ -179,6 +194,12 @@ def _fwd_fused_indexer_loss_stage2_kernel(
     stride_smdb,
     stride_smdh,
     stride_smdq,
+    # softmax m1 strides: [B, Sq]
+    stride_sm1b,
+    stride_sm1q,
+    # softmax dd strides: [B, Sq]
+    stride_sd1b,
+    stride_sd1q,
     # Dimensions
     AH: tl.constexpr,
     AD: tl.constexpr,
@@ -206,31 +227,12 @@ def _fwd_fused_indexer_loss_stage2_kernel(
     ak_base = Attn_Key_ptr + b * stride_akb
 
     # 1-pass loss recursion
-    m1_i = tl.full([BLOCK_SQ], float("-inf"), dtype=tl.float32)
-    d1_i = tl.zeros([BLOCK_SQ], dtype=tl.float32)
+    m1_i = tl.load(m1_ptr + b * stride_sm1b + sq * stride_sm1q, mask=sq_valid, other=float("-inf"))
+    d1_i = tl.load(d1_ptr + b * stride_sd1b + sq * stride_sd1q, mask=sq_valid, other=0.0)
     loss_i = tl.zeros([BLOCK_SQ], dtype=tl.float32)
 
-    # compute the first pass for attn softmax and index softmax
-    # apply causal mask by loop trunctation
-    causal_sk = tl.minimum(tl.min(sq) + 1, Sk)
-    for sk_start in tl.range(0, causal_sk, BLOCK_SK):
-        sk_offs = sk_start + tl.arange(0, BLOCK_SK)
-        sk_valid = sk_offs < Sk
-
-        index_scores = tl.load(Index_Scores_ptr + b * stride_ibs + sq[:, None] * stride_isq + sk_offs[None, :] * stride_isk, mask=(sq_valid[:, None] & sk_valid[None, :]), other=float("-inf"))
-        
-        if SPARSE_LOSS:
-            index_mask_ptrs = Index_Mask_ptr + b * stride_imb + sq[:, None] * stride_ims + sk_offs[None, :] * stride_imk
-            index_mask = tl.load(index_mask_ptrs, mask=(sq_valid[:, None] & sk_valid[None, :]), other=float("-inf"))
-            index_scores += index_mask
-
-        # first pass for index softmax
-        m1_i_1 = m1_i
-        m1_i = tl.maximum(m1_i, tl.max(index_scores, axis=1))
-        m1_i = tl.where(m1_i <= float("-inf"), 0.0, m1_i)
-        d1_i = d1_i * tl.exp(m1_i_1 - m1_i) + tl.exp(index_scores - m1_i[:, None]).sum(axis=1)
-
     # recompute for the second pass of attn softmax
+    causal_sk = tl.minimum(tl.min(sq) + 1, Sk)
     for sk_start in tl.range(0, causal_sk, BLOCK_SK):
         sk_offs = sk_start + tl.arange(0, BLOCK_SK)
         sk_valid = sk_offs < Sk
@@ -322,6 +324,8 @@ def fwd_fused_indexer_loss(
 
     softmax_m = torch.full((AB, AH, ASq), float("-inf"), dtype=torch.float32, device=attn_query.device)
     softmax_d = torch.full((AB, AH, ASq), 0.0, dtype=torch.float32, device=attn_query.device)
+    softmax_m1 = torch.full((AB, ASq), float("-inf"), dtype=torch.float32, device=attn_query.device)
+    softmax_d1 = torch.full((AB, ASq), 0.0, dtype=torch.float32, device=attn_query.device)
 
     stage1_grid = (AB, attn_num_sq_blocks, AH)
     _fwd_fused_indexer_loss_stage1_kernel[stage1_grid](
@@ -332,6 +336,8 @@ def fwd_fused_indexer_loss(
         Index_Mask_ptr=index_mask,
         m_ptr=softmax_m,
         d_ptr=softmax_d,
+        m1_ptr=softmax_m1,
+        d1_ptr=softmax_d1,
         # Attn query strides: [Sq, B, H, D]
         stride_asq=attn_query.stride(0),
         stride_aqb=attn_query.stride(1),
@@ -361,6 +367,12 @@ def fwd_fused_indexer_loss(
         stride_smdb=softmax_d.stride(0),
         stride_smdh=softmax_d.stride(1),
         stride_smdq=softmax_d.stride(2),
+        # softmax m1 strides: [B, Sq]
+        stride_sm1b=softmax_m1.stride(0),
+        stride_sm1q=softmax_m1.stride(1),
+        # softmax dd strides: [B, Sq]
+        stride_sd1b=softmax_d1.stride(0),
+        stride_sd1q=softmax_d1.stride(1),
         # Dimensions
         AH=AH,
         AD=AD,
@@ -386,6 +398,8 @@ def fwd_fused_indexer_loss(
         Index_Mask_ptr=index_mask,
         m_ptr=softmax_m,
         d_ptr=softmax_d,
+        m1_ptr=softmax_m1,
+        d1_ptr=softmax_d1,
         # Attn query strides: [Sq, B, H, D]
         stride_asq=attn_query.stride(0),
         stride_aqb=attn_query.stride(1),
@@ -415,6 +429,12 @@ def fwd_fused_indexer_loss(
         stride_smdb=softmax_d.stride(0),
         stride_smdh=softmax_d.stride(1),
         stride_smdq=softmax_d.stride(2),
+        # softmax m1 strides: [B, Sq]
+        stride_sm1b=softmax_m1.stride(0),
+        stride_sm1q=softmax_m1.stride(1),
+        # softmax dd strides: [B, Sq]
+        stride_sd1b=softmax_d1.stride(0),
+        stride_sd1q=softmax_d1.stride(1),
         # Dimensions
         AH=AH,
         AD=AD,
